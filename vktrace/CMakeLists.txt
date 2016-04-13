@@ -26,8 +26,12 @@ if (NOT PYTHONINTERP_FOUND)
 endif()
 
 find_package(Qt5 COMPONENTS Widgets Gui Core Svg)
-if (NOT Qt5_FOUND)
-    message(WARNING "Missing Qt5 development libraries: sudo apt-get install qt5-default libqt5svg5-dev")
+if (WIN32)
+    if (NOT Qt5_FOUND)
+        message(WARNING "Qt5 dev libraries not found, vktraceviewer will not be built.")
+        message(WARNING "To enable build of vktraceviewer, set env var Qt5_Dir to")
+        message(WARNING "C:\Qt\5.3\msvc2013_64\lib\cmake\Qt5 or C:\Qt\5.3\msvc2013\lib\cmake\Qt5")
+    endif()
 endif()
 
 include_directories(
@@ -50,8 +54,12 @@ add_subdirectory(src/vktrace_common)
 add_subdirectory(src/vktrace_trace)
 add_subdirectory(src/vktrace_layer)
 add_subdirectory(src/vktrace_replay)
-if (Qt5_FOUND)
-    add_subdirectory(src/vktrace_viewer)
+if (WIN32)
+    # Only build vktraceviewer on Windows
+    # And Qt5 must be available
+    if (Qt5_FOUND)
+        add_subdirectory(src/vktrace_viewer)
+    endif()
 endif()
 
 # use macro from stackoverflow (link below) to get all the extensions that are on the current system
