@@ -15,8 +15,16 @@ macro(run_vk_vtlayer_generate subcmd output)
     )
 endmacro()
 
+macro(run_vk_layer_xml_generate subcmd output)
+    add_custom_command(OUTPUT ${output}
+        COMMAND ${PYTHON_CMD} ${PROJECT_SOURCE_DIR}/genvk.py -registry ${PROJECT_SOURCE_DIR}/vk.xml ${output}
+        DEPENDS ${PROJECT_SOURCE_DIR}/vk.xml ${PROJECT_SOURCE_DIR}/generator.py ${PROJECT_SOURCE_DIR}/genvk.py ${PROJECT_SOURCE_DIR}/reg.py
+    )
+endmacro()
+
 set(LAYER_JSON_FILES
     VkLayer_api_dump
+    VkLayer_api_dump2
     VkLayer_basic
     VkLayer_generic
     VkLayer_multi
@@ -137,6 +145,8 @@ add_custom_target(generate_vt_helpers DEPENDS
 #VulkanTools layers
 run_vk_vtlayer_generate(generic generic_layer.cpp)
 run_vk_vtlayer_generate(api_dump api_dump.cpp)
+run_vk_layer_xml_generate(APIDump api_dump2.h)
+
 
 # Layer Utils Library
 # For Windows, we use a static lib because the Windows loader has a fairly restrictive loader search
@@ -155,4 +165,6 @@ add_vk_layer(multi multi.cpp ../layers/vk_layer_table.cpp)
 add_vk_layer(generic generic_layer.cpp ../layers/vk_layer_table.cpp)
 add_vk_layer(api_dump api_dump.cpp ../layers/vk_layer_table.cpp)
 add_vk_layer(screenshot screenshot.cpp ../layers/vk_layer_table.cpp)
+add_vk_layer(api_dump2 api_dump2.cpp api_dump2.h ../layers/vk_layer_table.cpp)
+
 

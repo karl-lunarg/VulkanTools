@@ -420,6 +420,79 @@ class ParamCheckerGeneratorOptions(GeneratorOptions):
         self.indentFuncPointer = indentFuncPointer
         self.alignFuncParam  = alignFuncParam
 
+# APIDumpGeneratorOptions - subclass of GeneratorOptions.
+#
+# Adds options used by APIDumpOutputGenerator objects during parameter validation
+# generation.
+#
+# Additional members
+#   prefixText - list of strings to prefix generated header with
+#     (usually a copyright statement + calling convention macros).
+#   protectFile - True if multiple inclusion protection should be
+#     generated (based on the filename) around the entire header.
+#   protectFeature - True if #ifndef..#endif protection should be
+#     generated around a feature interface in the header file.
+#   genFuncPointers - True if function pointer typedefs should be
+#     generated
+#   protectProto - If conditional protection should be generated
+#     around prototype declarations, set to either '#ifdef'
+#     to require opt-in (#ifdef protectProtoStr) or '#ifndef'
+#     to require opt-out (#ifndef protectProtoStr). Otherwise
+#     set to None.
+#   protectProtoStr - #ifdef/#ifndef symbol to use around prototype
+#     declarations, if protectProto is set
+#   apicall - string to use for the function declaration prefix,
+#     such as APICALL on Windows.
+#   apientry - string to use for the calling convention macro,
+#     in typedefs, such as APIENTRY.
+#   apientryp - string to use for the calling convention macro
+#     in function pointer typedefs, such as APIENTRYP.
+#   indentFuncProto - True if prototype declarations should put each
+#     parameter on a separate line
+#   indentFuncPointer - True if typedefed function pointers should put each
+#     parameter on a separate line
+#   alignFuncParam - if nonzero and parameters are being put on a
+#     separate line, align parameter names at the specified column
+class APIDumpGeneratorOptions(GeneratorOptions):
+    """Represents options during C interface generation for headers"""
+    def __init__(self,
+                 filename = None,
+                 apiname = None,
+                 profile = None,
+                 versions = '.*',
+                 emitversions = '.*',
+                 defaultExtensions = None,
+                 addExtensions = None,
+                 removeExtensions = None,
+                 sortProcedure = regSortFeatures,
+                 prefixText = "",
+                 genFuncPointers = True,
+                 protectFile = True,
+                 protectFeature = True,
+                 protectProto = None,
+                 protectProtoStr = None,
+                 apicall = '',
+                 apientry = '',
+                 apientryp = '',
+                 indentFuncProto = True,
+                 indentFuncPointer = False,
+                 alignFuncParam = 0):
+        GeneratorOptions.__init__(self, filename, apiname, profile,
+                                  versions, emitversions, defaultExtensions,
+                                  addExtensions, removeExtensions, sortProcedure)
+        self.prefixText      = prefixText
+        self.genFuncPointers = genFuncPointers
+        self.protectFile     = protectFile
+        self.protectFeature  = protectFeature
+        self.protectProto    = protectProto
+        self.protectProtoStr = protectProtoStr
+        self.apicall         = apicall
+        self.apientry        = apientry
+        self.apientryp       = apientryp
+        self.indentFuncProto = indentFuncProto
+        self.indentFuncPointer = indentFuncPointer
+        self.alignFuncParam  = alignFuncParam
+
 
 # OutputGenerator - base class for generating API interfaces.
 # Manages basic logic, logging, and output file control
@@ -3579,6 +3652,817 @@ class ParamCheckerOutputGenerator(OutputGenerator):
                 cmdDef += '    const {}*'.format(struct.name).ljust(self.genOpts.alignFuncParam) + ' pStruct)\n'
                 cmdDef += '{\n'
                 cmdDef += indent + 'bool skipCall = false;\n'
+                cmdDef += '\n'
+                cmdDef += indent + 'if (pStruct != NULL) {'
+                cmdDef += funcBody
+                cmdDef += indent +'}\n'
+                cmdDef += '\n'
+                cmdDef += indent + 'return skipCall;\n'
+                cmdDef += '}\n'
+                self.appendSection('command', cmdDef)
+    #
+    # Generate the command param check code from the captured data
+    def processCmdData(self):
+        indent = self.incIndent(None)
+        for command in self.commands:
+            cmdBody, unused = self.genFuncBody(indent, '"{}"'.format(command.name), command.params, '', None, None, False)
+            if cmdBody:
+                cmdDef = self.getCmdDef(command) + '\n'
+                cmdDef += '{\n'
+                # Process unused parameters
+                # Ignore the first dispatch handle parameter, which is not
+                # processed by parameter_validation (except for vkCreateInstance, which
+                # does not have a handle as its first parameter)
+                startIndex = 1
+                if command.name == 'vkCreateInstance':
+                    startIndex = 0
+                for name in unused[startIndex:]:
+                    cmdDef += indent + 'UNUSED_PARAMETER({});\n'.format(name)
+                if len(unused) > 1:
+                    cmdDef += '\n'
+                cmdDef += indent + 'bool skipCall = false;\n'
+                cmdDef += cmdBody
+                cmdDef += '\n'
+                cmdDef += indent + 'return skipCall;\n'
+                cmdDef += '}\n'
+                self.appendSection('command', cmdDef)
+
+
+# APIDumpOutputGenerator - subclass of OutputGenerator.
+# Generates param checker layer code.
+#
+# ---- methods ----
+# APIDumpOutputGenerator(errFile, warnFile, diagFile) - args as for
+#   OutputGenerator. Defines additional internal state.
+# ---- methods overriding base class ----
+# beginFile(genOpts)
+# endFile()
+# beginFeature(interface, emit)
+# endFeature()
+# genType(typeinfo,name)
+# genStruct(typeinfo,name)
+# genGroup(groupinfo,name)
+# genEnum(enuminfo, name)
+# genCmd(cmdinfo)
+class APIDumpOutputGenerator(OutputGenerator):
+    """Generate ParamChecker code based on XML element attributes"""
+    # This is an ordered list of sections in the header file.
+    ALL_SECTIONS = ['command']
+    def __init__(self,
+                 errFile = sys.stderr,
+                 warnFile = sys.stderr,
+                 diagFile = sys.stdout):
+        OutputGenerator.__init__(self, errFile, warnFile, diagFile)
+        self.INDENT_SPACES = 4
+        # Struct member categories, to be used to avoid validating output values retrieved by queries such as vkGetPhysicalDeviceProperties
+        # For example, VkPhysicalDeviceProperties will be ignored for vkGetPhysicalDeviceProperties where it is an ouput, but will be processed
+        # for vkCreateDevice where is it a member of the VkDeviceCreateInfo input parameter.
+        self.STRUCT_MEMBERS_INPUT_ONLY_NONE = 1         # The struct contains no 'input-only' members and will always be processed
+        self.STRUCT_MEMBERS_INPUT_ONLY_MIXED = 2        # The struct contains some 'input-only' members; these members will only be processed when the struct is an input parameter
+        self.STRUCT_MEMBERS_INPUT_ONLY_EXCLUSIVE = 3    # The struct contains only 'input-only' members; the entire struct will only be processed when it is an input parameter
+        # Commands to ignore
+        self.blacklist = [
+            'vkGetInstanceProcAddr',
+            'vkGetDeviceProcAddr',
+            'vkEnumerateInstanceLayerProperties',
+            'vkEnumerateInstanceExtensionsProperties',
+            'vkEnumerateDeviceLayerProperties',
+            'vkEnumerateDeviceExtensionsProperties',
+            'vkCreateDebugReportCallbackEXT',
+            'vkDebugReportMessageEXT']
+        # Internal state - accumulators for different inner block text
+        self.sections = dict([(section, []) for section in self.ALL_SECTIONS])
+        self.structNames = []                             # List of Vulkan struct typenames
+        self.stypes = []                                  # Values from the VkStructureType enumeration
+        self.structTypes = dict()                         # Map of Vulkan struct typename to required VkStructureType
+        self.commands = []                                # List of CommandData records for all Vulkan commands
+        self.structMembers = []                           # List of StructMemberData records for all Vulkan structs
+        self.validatedStructs = dict()                    # Map of structs containing members that require validation to a value indicating
+                                                          # that the struct contains members that are only validated when it is an input parameter
+        self.enumRanges = dict()                          # Map of enum name to BEGIN/END range values
+        # Named tuples to store struct and command data
+        self.StructType = namedtuple('StructType', ['name', 'value'])
+        self.CommandParam = namedtuple('CommandParam', ['type', 'name', 'ispointer', 'isstaticarray', 'isbool', 'israngedenum',
+                                                        'isconst', 'isoptional', 'iscount', 'len', 'extstructs', 'cdecl'])
+        self.CommandData = namedtuple('CommandData', ['name', 'params', 'cdecl'])
+        self.StructMemberData = namedtuple('StructMemberData', ['name', 'members'])
+    #
+    def incIndent(self, indent):
+        inc = ' ' * self.INDENT_SPACES
+        if indent:
+            return indent + inc
+        return inc
+    #
+    def decIndent(self, indent):
+        if indent and (len(indent) > self.INDENT_SPACES):
+            return indent[:-self.INDENT_SPACES]
+        return ''
+    #
+    def beginFile(self, genOpts):
+        OutputGenerator.beginFile(self, genOpts)
+        # C-specific
+        #
+        # User-supplied prefix text, if any (list of strings)
+        if (genOpts.prefixText):
+            for s in genOpts.prefixText:
+                write(s, file=self.outFile)
+        #
+        # Multiple inclusion protection & C++ wrappers.
+        if (genOpts.protectFile and self.genOpts.filename):
+            headerSym = re.sub('\.h', '_H', os.path.basename(self.genOpts.filename)).upper()
+            write('#ifndef', headerSym, file=self.outFile)
+            write('#define', headerSym, '1', file=self.outFile)
+            self.newline()
+        #
+        # Headers
+        write('#include <string>', file=self.outFile)
+        self.newline()
+        write('#include "vulkan/vulkan.h"', file=self.outFile)
+        write('#include "vk_layer_extension_utils.h"', file=self.outFile)
+        write('#include "parameter_validation_utils.h"', file=self.outFile)
+        #
+        # Macros
+        self.newline()
+        write('#ifndef UNUSED_PARAMETER', file=self.outFile)
+        write('#define UNUSED_PARAMETER(x) (void)(x)', file=self.outFile)
+        write('#endif // UNUSED_PARAMETER', file=self.outFile)
+    def endFile(self):
+        # C-specific
+        # Finish C++ wrapper and multiple inclusion protection
+        self.newline()
+        if (self.genOpts.protectFile and self.genOpts.filename):
+            self.newline()
+            write('#endif', file=self.outFile)
+        # Finish processing in superclass
+        OutputGenerator.endFile(self)
+    def beginFeature(self, interface, emit):
+        # Start processing in superclass
+        OutputGenerator.beginFeature(self, interface, emit)
+        # C-specific
+        # Accumulate includes, defines, types, enums, function pointer typedefs,
+        # end function prototypes separately for this feature. They're only
+        # printed in endFeature().
+        self.sections = dict([(section, []) for section in self.ALL_SECTIONS])
+        self.structNames = []
+        self.stypes = []
+        self.structTypes = dict()
+        self.commands = []
+        self.structMembers = []
+        self.validatedStructs = dict()
+        self.enumRanges = dict()
+    def endFeature(self):
+        # C-specific
+        # Actually write the interface to the output file.
+        if (self.emit):
+            self.newline()
+            # If type declarations are needed by other features based on
+            # this one, it may be necessary to suppress the ExtraProtect,
+            # or move it below the 'for section...' loop.
+            if (self.featureExtraProtect != None):
+                write('#ifdef', self.featureExtraProtect, file=self.outFile)
+            # Generate the struct member checking code from the captured data
+            self.prepareStructMemberData()
+            self.processStructMemberData()
+            # Generate the command parameter checking code from the captured data
+            self.processCmdData()
+            if (self.sections['command']):
+                if (self.genOpts.protectProto):
+                    write(self.genOpts.protectProto,
+                          self.genOpts.protectProtoStr, file=self.outFile)
+                write('\n'.join(self.sections['command']), end='', file=self.outFile)
+            if (self.featureExtraProtect != None):
+                write('#endif /*', self.featureExtraProtect, '*/', file=self.outFile)
+            else:
+                self.newline()
+        # Finish processing in superclass
+        OutputGenerator.endFeature(self)
+    #
+    # Append a definition to the specified section
+    def appendSection(self, section, text):
+        # self.sections[section].append('SECTION: ' + section + '\n')
+        self.sections[section].append(text)
+    #
+    # Type generation
+    def genType(self, typeinfo, name):
+        OutputGenerator.genType(self, typeinfo, name)
+        typeElem = typeinfo.elem
+        # If the type is a struct type, traverse the imbedded <member> tags
+        # generating a structure. Otherwise, emit the tag text.
+        category = typeElem.get('category')
+        if (category == 'struct' or category == 'union'):
+            self.structNames.append(name)
+            self.genStruct(typeinfo, name)
+    #
+    # Struct parameter check generation.
+    # This is a special case of the <type> tag where the contents are
+    # interpreted as a set of <member> tags instead of freeform C
+    # C type declarations. The <member> tags are just like <param>
+    # tags - they are a declaration of a struct or union member.
+    # Only simple member declarations are supported (no nested
+    # structs etc.)
+    def genStruct(self, typeinfo, typeName):
+        OutputGenerator.genStruct(self, typeinfo, typeName)
+        members = typeinfo.elem.findall('.//member')
+        #
+        # Iterate over members once to get length parameters for arrays
+        lens = set()
+        for member in members:
+            len = self.getLen(member)
+            if len:
+                lens.add(len)
+        #
+        # Generate member info
+        membersInfo = []
+        for member in members:
+            # Get the member's type and name
+            info = self.getTypeNameTuple(member)
+            type = info[0]
+            name = info[1]
+            stypeValue = ''
+            cdecl = self.makeCParamDecl(member, 0)
+            # Process VkStructureType
+            if type == 'VkStructureType':
+                # Extract the required struct type value from the comments
+                # embedded in the original text defining the 'typeinfo' element
+                rawXml = etree.tostring(typeinfo.elem).decode('ascii')
+                result = re.search(r'VK_STRUCTURE_TYPE_\w+', rawXml)
+                if result:
+                    value = result.group(0)
+                    # Make sure value is valid
+                    #if value not in self.stypes:
+                    #    print('WARNING: {} is not part of the VkStructureType enumeration [{}]'.format(value, typeName))
+                else:
+                    value = typeName
+                    # Remove EXT
+                    value = re.sub('EXT', '', value)
+                    # Add underscore between lowercase then uppercase
+                    value = re.sub('([a-z0-9])([A-Z])', r'\1_\2', value)
+                    # Change to uppercase
+                    value = value.upper()
+                    # Add STRUCTURE_TYPE_
+                    value = re.sub('VK_', 'VK_STRUCTURE_TYPE_', value)
+                # Store the required type value
+                self.structTypes[typeName] = self.StructType(name=name, value=value)
+            #
+            # Store pointer/array/string info
+            # Check for parameter name in lens set
+            iscount = False
+            if name in lens:
+                iscount = True
+            # The pNext members are not tagged as optional, but are treated as
+            # optional for parameter NULL checks.  Static array members
+            # are also treated as optional to skip NULL pointer validation, as
+            # they won't be NULL.
+            isstaticarray = self.paramIsStaticArray(member)
+            isoptional = False
+            if self.paramIsOptional(member) or (name == 'pNext') or (isstaticarray):
+                isoptional = True
+            membersInfo.append(self.CommandParam(type=type, name=name,
+                                                ispointer=self.paramIsPointer(member),
+                                                isstaticarray=isstaticarray,
+                                                isbool=True if type == 'VkBool32' else False,
+                                                israngedenum=True if type in self.enumRanges else False,
+                                                isconst=True if 'const' in cdecl else False,
+                                                isoptional=isoptional,
+                                                iscount=iscount,
+                                                len=self.getLen(member),
+                                                extstructs=member.attrib.get('validextensionstructs') if name == 'pNext' else None,
+                                                cdecl=cdecl))
+        self.structMembers.append(self.StructMemberData(name=typeName, members=membersInfo))
+    #
+    # Capture group (e.g. C "enum" type) info to be used for
+    # param check code generation.
+    # These are concatenated together with other types.
+    def genGroup(self, groupinfo, groupName):
+        OutputGenerator.genGroup(self, groupinfo, groupName)
+        groupElem = groupinfo.elem
+        #
+        # Store the sType values
+        if groupName == 'VkStructureType':
+            for elem in groupElem.findall('enum'):
+                self.stypes.append(elem.get('name'))
+        else:
+            # Determine if begin/end ranges are needed (we don't do this for VkStructureType, which has a more finely grained check)
+            expandName = re.sub(r'([0-9a-z_])([A-Z0-9][^A-Z0-9]?)',r'\1_\2',groupName).upper()
+            expandPrefix = expandName
+            expandSuffix = ''
+            expandSuffixMatch = re.search(r'[A-Z][A-Z]+$',groupName)
+            if expandSuffixMatch:
+                expandSuffix = '_' + expandSuffixMatch.group()
+                # Strip off the suffix from the prefix
+                expandPrefix = expandName.rsplit(expandSuffix, 1)[0]
+            isEnum = ('FLAG_BITS' not in expandPrefix)
+            if isEnum:
+                self.enumRanges[groupName] = (expandPrefix + '_BEGIN_RANGE' + expandSuffix, expandPrefix + '_END_RANGE' + expandSuffix)
+    #
+    # Capture command parameter info to be used for param
+    # check code generation.
+    def genCmd(self, cmdinfo, name):
+        OutputGenerator.genCmd(self, cmdinfo, name)
+        if name not in self.blacklist:
+            params = cmdinfo.elem.findall('param')
+            # Get list of array lengths
+            lens = set()
+            for param in params:
+                len = self.getLen(param)
+                if len:
+                    lens.add(len)
+            # Get param info
+            paramsInfo = []
+            for param in params:
+                paramInfo = self.getTypeNameTuple(param)
+                cdecl = self.makeCParamDecl(param, 0)
+                # Check for parameter name in lens set
+                iscount = False
+                if paramInfo[1] in lens:
+                    iscount = True
+                paramsInfo.append(self.CommandParam(type=paramInfo[0], name=paramInfo[1],
+                                                    ispointer=self.paramIsPointer(param),
+                                                    isstaticarray=self.paramIsStaticArray(param),
+                                                    isbool=True if paramInfo[0] == 'VkBool32' else False,
+                                                    israngedenum=True if paramInfo[0] in self.enumRanges else False,
+                                                    isconst=True if 'const' in cdecl else False,
+                                                    isoptional=self.paramIsOptional(param),
+                                                    iscount=iscount,
+                                                    len=self.getLen(param),
+                                                    extstructs=None,
+                                                    cdecl=cdecl))
+            self.commands.append(self.CommandData(name=name, params=paramsInfo, cdecl=self.makeCDecls(cmdinfo.elem)[0]))
+    #
+    # Check if the parameter passed in is a pointer
+    def paramIsPointer(self, param):
+        ispointer = 0
+        paramtype = param.find('type')
+        if (paramtype.tail is not None) and ('*' in paramtype.tail):
+            ispointer = paramtype.tail.count('*')
+        elif paramtype.text[:4] == 'PFN_':
+            # Treat function pointer typedefs as a pointer to a single value
+            ispointer = 1
+        return ispointer
+    #
+    # Check if the parameter passed in is a static array
+    def paramIsStaticArray(self, param):
+        isstaticarray = 0
+        paramname = param.find('name')
+        if (paramname.tail is not None) and ('[' in paramname.tail):
+            isstaticarray = paramname.tail.count('[')
+        return isstaticarray
+    #
+    # Check if the parameter passed in is optional
+    # Returns a list of Boolean values for comma separated len attributes (len='false,true')
+    def paramIsOptional(self, param):
+        # See if the handle is optional
+        isoptional = False
+        # Simple, if it's optional, return true
+        optString = param.attrib.get('optional')
+        if optString:
+            if optString == 'true':
+                isoptional = True
+            elif ',' in optString:
+                opts = []
+                for opt in optString.split(','):
+                    val = opt.strip()
+                    if val == 'true':
+                        opts.append(True)
+                    elif val == 'false':
+                        opts.append(False)
+                    else:
+                        print('Unrecognized len attribute value',val)
+                isoptional = opts
+        return isoptional
+    #
+    # Retrieve the value of the len tag
+    def getLen(self, param):
+        result = None
+        len = param.attrib.get('len')
+        if len and len != 'null-terminated':
+            # For string arrays, 'len' can look like 'count,null-terminated',
+            # indicating that we have a null terminated array of strings.  We
+            # strip the null-terminated from the 'len' field and only return
+            # the parameter specifying the string count
+            if 'null-terminated' in len:
+                result = len.split(',')[0]
+            else:
+                result = len
+        return result
+    #
+    # Retrieve the type and name for a parameter
+    def getTypeNameTuple(self, param):
+        type = ''
+        name = ''
+        for elem in param:
+            if elem.tag == 'type':
+                type = noneStr(elem.text)
+            elif elem.tag == 'name':
+                name = noneStr(elem.text)
+        return (type, name)
+    #
+    # Find a named parameter in a parameter list
+    def getParamByName(self, params, name):
+        for param in params:
+            if param.name == name:
+                return param
+        return None
+    #
+    # Extract length values from latexmath.  Currently an inflexible solution that looks for specific
+    # patterns that are found in vk.xml.  Will need to be updated when new patterns are introduced.
+    def parseLateXMath(self, source):
+        name = 'ERROR'
+        decoratedName = 'ERROR'
+        if 'mathit' in source:
+            # Matches expressions similar to 'latexmath:[$\lceil{\mathit{rasterizationSamples} \over 32}\rceil$]'
+            match = re.match(r'latexmath\s*\:\s*\[\s*\$\\l(\w+)\s*\{\s*\\mathit\s*\{\s*(\w+)\s*\}\s*\\over\s*(\d+)\s*\}\s*\\r(\w+)\$\s*\]', source)
+            if not match or match.group(1) != match.group(4):
+                raise 'Unrecognized latexmath expression'
+            name = match.group(2)
+            decoratedName = '{}({}/{})'.format(*match.group(1, 2, 3))
+        else:
+            # Matches expressions similar to 'latexmath : [$dataSize \over 4$]'
+            match = re.match(r'latexmath\s*\:\s*\[\s*\$\s*(\w+)\s*\\over\s*(\d+)\s*\$\s*\]', source)
+            name = match.group(1)
+            decoratedName = '{}/{}'.format(*match.group(1, 2))
+        return name, decoratedName
+    #
+    # Get the length paramater record for the specified parameter name
+    def getLenParam(self, params, name):
+        lenParam = None
+        if name:
+            if '->' in name:
+                # The count is obtained by dereferencing a member of a struct parameter
+                lenParam = self.CommandParam(name=name, iscount=True, ispointer=False, isbool=False, israngedenum=False, isconst=False,
+                                             isstaticarray=None, isoptional=False, type=None, len=None, extstructs=None, cdecl=None)
+            elif 'latexmath' in name:
+                lenName, decoratedName = self.parseLateXMath(name)
+                lenParam = self.getParamByName(params, lenName)
+                # TODO: Zero-check the result produced by the equation?
+                # Copy the stored len parameter entry and overwrite the name with the processed latexmath equation
+                #param = self.getParamByName(params, lenName)
+                #lenParam = self.CommandParam(name=decoratedName, iscount=param.iscount, ispointer=param.ispointer,
+                #                             isoptional=param.isoptional, type=param.type, len=param.len,
+                #                             isstaticarray=param.isstaticarray, extstructs=param.extstructs, cdecl=param.cdecl)
+            else:
+                lenParam = self.getParamByName(params, name)
+        return lenParam
+    #
+    # Convert a vulkan.h command declaration into a parameter_validation.h definition
+    def getCmdDef(self, cmd):
+        #
+        # Strip the trailing ';' and split into individual lines
+        lines = cmd.cdecl[:-1].split('\n')
+        # Replace Vulkan prototype
+        lines[0] = 'static bool api_dump_' + cmd.name + '('
+        # Replace the first argument with debug_report_data, when the first
+        # argument is a handle (not vkCreateInstance)
+        reportData = '    debug_report_data*'.ljust(self.genOpts.alignFuncParam) + 'report_data,'
+        if cmd.name != 'vkCreateInstance':
+            lines[1] = reportData
+        else:
+            lines.insert(1, reportData)
+        return '\n'.join(lines)
+    #
+    # Generate the code to check for a NULL dereference before calling the
+    # validation function
+    def genCheckedLengthCall(self, indent, name, expr):
+        count = name.count('->')
+        if count:
+            checkedExpr = ''
+            localIndent = indent
+            elements = name.split('->')
+            # Open the if expression blocks
+            for i in range(0, count):
+                checkedExpr += localIndent + 'if ({} != NULL) {{\n'.format('->'.join(elements[0:i+1]))
+                localIndent = self.incIndent(localIndent)
+            # Add the validation expression
+            checkedExpr += localIndent + expr
+            # Close the if blocks
+            for i in range(0, count):
+                localIndent = self.decIndent(localIndent)
+                checkedExpr += localIndent + '}\n'
+            return checkedExpr
+        # No if statements were required
+        return indent + expr
+    #
+    # Generate the parameter checking code
+    def genFuncBody(self, indent, name, values, valuePrefix, variablePrefix, structName, needConditionCheck):
+        funcBody = ''
+        unused = []
+        # Code to conditionally check parameters only when they are inputs.  Primarily avoids
+        # checking uninitialized members of output structs used to retrieve bools and enums.
+        # Conditional checks are grouped together to be appended to funcBody within a single
+        # if check for input parameter direction.
+        conditionalExprs = []
+        for value in values:
+            checkExpr = ''     # Code to check the current parameter
+            lenParam = None
+            #
+            # Generate the full name of the value, which will be printed in
+            # the error message, by adding the variable prefix to the
+            # value name
+            valueDisplayName = '(std::string({}) + std::string("{}")).c_str()'.format(variablePrefix, value.name) if variablePrefix else '"{}"'.format(value.name)
+            #
+            # Check for NULL pointers, ignore the inout count parameters that
+            # will be validated with their associated array
+            if (value.ispointer or value.isstaticarray) and not value.iscount:
+                #
+                # Parameters for function argument generation
+                req = 'true'    # Paramerter can be NULL
+                cpReq = 'true'  # Count pointer can be NULL
+                cvReq = 'true'  # Count value can be 0
+                lenDisplayName = None # Name of length parameter to print with validation messages; parameter name with prefix applied
+                #
+                # Generate required/optional parameter strings for the pointer and count values
+                if value.isoptional:
+                    req = 'false'
+                if value.len:
+                    # The parameter is an array with an explicit count parameter
+                    lenParam = self.getLenParam(values, value.len)
+                    lenDisplayName = '(std::string({}) + std::string("{}")).c_str()'.format(variablePrefix, lenParam.name) if variablePrefix else '"{}"'.format(lenParam.name)
+                    if lenParam.ispointer:
+                        # Count parameters that are pointers are inout
+                        if type(lenParam.isoptional) is list:
+                            if lenParam.isoptional[0]:
+                                cpReq = 'false'
+                            if lenParam.isoptional[1]:
+                                cvReq = 'false'
+                        else:
+                            if lenParam.isoptional:
+                                cpReq = 'false'
+                    else:
+                        if lenParam.isoptional:
+                            cvReq = 'false'
+                #
+                # If this is a pointer to a struct with an sType field, verify the type
+                if value.type in self.structTypes:
+                    stype = self.structTypes[value.type]
+                    if lenParam:
+                        # This is an array
+                        if lenParam.ispointer:
+                            # When the length parameter is a pointer, there is an extra Boolean parameter in the function call to indicate if it is required
+                            checkExpr = 'skipCall |= validate_struct_type_array(report_data, {}, {ldn}, {dn}, "{sv}", {pf}{ln}, {pf}{vn}, {sv}, {}, {}, {});\n'.format(name, cpReq, cvReq, req, ln=lenParam.name, ldn=lenDisplayName, dn=valueDisplayName, vn=value.name, sv=stype.value, pf=valuePrefix)
+                        else:
+                            checkExpr = 'skipCall |= validate_struct_type_array(report_data, {}, {ldn}, {dn}, "{sv}", {pf}{ln}, {pf}{vn}, {sv}, {}, {});\n'.format(name, cvReq, req, ln=lenParam.name, ldn=lenDisplayName, dn=valueDisplayName, vn=value.name, sv=stype.value, pf=valuePrefix)
+                    else:
+                        checkExpr = 'skipCall |= validate_struct_type(report_data, {}, {}, "{sv}", {}{vn}, {sv}, {});\n'.format(name, valueDisplayName, valuePrefix, req, vn=value.name, sv=stype.value)
+                elif value.name == 'pNext':
+                    # We need to ignore VkDeviceCreateInfo and VkInstanceCreateInfo, as the loader manipulates them in a way that is not documented in vk.xml
+                    if not structName in ['VkDeviceCreateInfo', 'VkInstanceCreateInfo']:
+                        # Generate an array of acceptable VkStructureType values for pNext
+                        extStructCount = 0
+                        extStructVar = 'NULL'
+                        extStructNames = 'NULL'
+                        if value.extstructs:
+                            structs = value.extstructs.split(',')
+                            checkExpr = 'const VkStructureType allowedStructs[] = {' + ', '.join([self.structTypes[s].value for s in structs]) + '};\n' + indent
+                            extStructCount = 'ARRAY_SIZE(allowedStructs)'
+                            extStructVar = 'allowedStructs'
+                            extStructNames = '"' + ', '.join(structs) + '"'
+                        checkExpr += 'skipCall |= validate_struct_pnext(report_data, {}, {}, {}, {}{vn}, {}, {});\n'.format(name, valueDisplayName, extStructNames, valuePrefix, extStructCount, extStructVar, vn=value.name)
+                else:
+                    if lenParam:
+                        # This is an array
+                        if lenParam.ispointer:
+                            # If count and array parameters are optional, there will be no validation
+                            if req == 'true' or cpReq == 'true' or cvReq == 'true':
+                                # When the length parameter is a pointer, there is an extra Boolean parameter in the function call to indicate if it is required
+                                checkExpr = 'skipCall |= validate_array(report_data, {}, {ldn}, {dn}, {pf}{ln}, {pf}{vn}, {}, {}, {});\n'.format(name, cpReq, cvReq, req, ln=lenParam.name, ldn=lenDisplayName, dn=valueDisplayName, vn=value.name, pf=valuePrefix)
+                        else:
+                            # If count and array parameters are optional, there will be no validation
+                            if req == 'true' or cvReq == 'true':
+                                funcName = 'validate_array' if value.type != 'char' else 'validate_string_array'
+                                checkExpr = 'skipCall |= {}(report_data, {}, {ldn}, {dn}, {pf}{ln}, {pf}{vn}, {}, {});\n'.format(funcName, name, cvReq, req, ln=lenParam.name, ldn=lenDisplayName, dn=valueDisplayName, vn=value.name, pf=valuePrefix)
+                    elif not value.isoptional:
+                        # Function pointers need a reinterpret_cast to void*
+                        if value.type[:4] == 'PFN_':
+                            checkExpr = 'skipCall |= validate_required_pointer(report_data, {}, {}, reinterpret_cast<const void*>({}{vn}));\n'.format(name, valueDisplayName, valuePrefix, vn=value.name)
+                        else:
+                            checkExpr = 'skipCall |= validate_required_pointer(report_data, {}, {}, {}{vn});\n'.format(name, valueDisplayName, valuePrefix, vn=value.name)
+                #
+                # If this is a pointer to a struct (input), see if it contains members that need to be checked
+                if value.type in self.validatedStructs and value.isconst:
+                    #
+                    # The name prefix used when reporting an error with a struct member (eg. the 'pCreateInfor->' in 'pCreateInfo->sType')
+                    if lenParam:
+                        prefix = '(std::string({}) + std::string("{}[i]->")).c_str()'.format(variablePrefix, value.name) if variablePrefix else '(std::string("{}[i]->")).c_str()'.format(value.name)
+                    else:
+                        prefix = '(std::string({}) + std::string("{}->")).c_str()'.format(variablePrefix, value.name) if variablePrefix else '"{}->"'.format(value.name)
+                    #
+                    membersInputOnly = self.validatedStructs[value.type]
+                    #
+                    # If the current struct has mixed 'input-only' and 'non-input-only' members, it needs an isInput flag
+                    if  membersInputOnly == self.STRUCT_MEMBERS_INPUT_ONLY_MIXED:
+                        # If this function is called from another struct validation function (valuePrefix is not empty), then we forward the 'isInput' prameter
+                        isInput = 'isInput'
+                        if not valuePrefix:
+                            # We are validating function parameters and need to determine if the current value is an input parameter
+                            isInput = 'true' if value.isconst else 'false'
+                        if checkExpr:
+                            checkExpr += '\n' + indent
+                        if lenParam:
+                            # Need to process all elements in the array
+                            checkExpr += 'if ({}{} != NULL) {{\n'.format(valuePrefix, value.name)
+                            indent = self.incIndent(indent)
+                            checkExpr += indent + 'for (uint32_t i = 0; i < {}{}; ++i) {{\n'.format(valuePrefix, lenParam.name)
+                            indent = self.incIndent(indent)
+                            checkExpr += indent + 'skipCall |= api_dump_{}(report_data, {}, {}, {}, &({}{}[i]));\n'.format(value.type, name, prefix, isInput, valuePrefix, value.name)
+                            indent = self.decIndent(indent)
+                            checkExpr += indent + '}\n'
+                            indent = self.decIndent(indent)
+                            checkExpr += indent + '}\n'
+                        else:
+                            checkExpr += 'skipCall |= api_dump_{}(report_data, {}, {}, {}, {}{});\n'.format(value.type, name, prefix, isInput, valuePrefix, value.name)
+                    else:
+                        # Validation function does not have an isInput field
+                        if lenParam:
+                            # Need to process all elements in the array
+                            expr = 'if ({}{} != NULL) {{\n'.format(valuePrefix, value.name)
+                            indent = self.incIndent(indent)
+                            expr += indent + 'for (uint32_t i = 0; i < {}{}; ++i) {{\n'.format(valuePrefix, lenParam.name)
+                            indent = self.incIndent(indent)
+                            expr += indent + 'skipCall |= api_dump_{}(report_data, {}, {}, &({}{}[i]));\n'.format(value.type, name, prefix, valuePrefix, value.name)
+                            indent = self.decIndent(indent)
+                            expr += indent + '}\n'
+                            indent = self.decIndent(indent)
+                            expr += indent + '}\n'
+                        else:
+                            expr = 'skipCall |= api_dump_{}(report_data, {}, {}, {}{});\n'.format(value.type, name, prefix, valuePrefix, value.name)
+                        #
+                        # If the struct only has input-only members and is a member of another struct, it is conditionally processed based on 'isInput'
+                        if valuePrefix and membersInputOnly == self.STRUCT_MEMBERS_INPUT_ONLY_EXCLUSIVE:
+                            if needConditionCheck:
+                                if expr.count('\n') > 1:
+                                    # TODO: Proper fix for this formatting workaround
+                                    conditionalExprs.append(expr.replace(' ' * 8, ' ' * 12))
+                                else:
+                                    conditionalExprs.append(expr)
+                            else:
+                                if checkExpr:
+                                    checkExpr += '\n' + indent
+                                checkExpr += expr
+                        #
+                        # If the struct is a function parameter (valuePrefix is empty) and only contains input-only parameters, it can be ignored if it is not an input
+                        elif (membersInputOnly == self.STRUCT_MEMBERS_INPUT_ONLY_NONE) or (not valuePrefix and membersInputOnly == self.STRUCT_MEMBERS_INPUT_ONLY_EXCLUSIVE and value.isconst):
+                            if checkExpr:
+                                checkExpr += '\n' + indent
+                            checkExpr += expr
+                elif value.isbool and value.isconst:
+                    expr = 'skipCall |= validate_bool32_array(report_data, {}, {}, {pf}{}, {pf}{});\n'.format(name, valueDisplayName, lenParam.name, value.name, pf=valuePrefix)
+                    if checkExpr:
+                        checkExpr += '\n' + indent
+                    checkExpr += expr
+                elif value.israngedenum and value.isconst:
+                    enumRange = self.enumRanges[value.type]
+                    expr = 'skipCall |= validate_ranged_enum_array(report_data, {}, {}, "{}", {}, {}, {pf}{}, {pf}{});\n'.format(name, valueDisplayName, value.type, enumRange[0], enumRange[1], lenParam.name, value.name, pf=valuePrefix)
+                    if checkExpr:
+                        checkExpr += '\n' + indent
+                    checkExpr += expr
+            elif value.type in self.validatedStructs:
+                # The name of the value with prefix applied
+                prefix = '(std::string({}) + std::string("{}.")).c_str()'.format(variablePrefix, value.name) if variablePrefix else '"{}."'.format(value.name)
+                #
+                membersInputOnly = self.validatedStructs[value.type]
+                #
+                # If the current struct has mixed 'input-only' and 'non-input-only' members, it needs an isInput flag
+                if  membersInputOnly == self.STRUCT_MEMBERS_INPUT_ONLY_MIXED:
+                    # If this function is called from another struct validation function (valuePrefix is not empty), then we forward the 'isInput' prameter
+                    isInput = 'isInput'
+                    if not valuePrefix:
+                        # We are validating function parameters and need to determine if the current value is an input parameter
+                        isInput = 'true' if value.isconst else 'false'
+                    if checkExpr:
+                        checkExpr += '\n' + indent
+                    checkExpr += 'skipCall |= api_dump_{}(report_data, {}, {}, {}, &({}{}));\n'.format(value.type, name, prefix, isInput, valuePrefix, value.name)
+                else:
+                    # Validation function does not have an isInput field
+                    expr = 'skipCall |= api_dump_{}(report_data, {}, {}, &({}{}));\n'.format(value.type, name, prefix, valuePrefix, value.name)
+                    #
+                    # If the struct only has input-only members and is a member of another struct, it is conditionally processed based on 'isInput'
+                    if valuePrefix and membersInputOnly == self.STRUCT_MEMBERS_INPUT_ONLY_EXCLUSIVE:
+                        if needConditionCheck:
+                            conditionalExprs.append(expr)
+                        else:
+                            if checkExpr:
+                                checkExpr += '\n' + indent
+                            checkExpr += expr
+                    #
+                    # If the struct is a function parameter (valuePrefix is empty) and only contains input-only parameters, it can be ignored if it is not an input
+                    elif (membersInputOnly == self.STRUCT_MEMBERS_INPUT_ONLY_NONE) or (not valuePrefix and membersInputOnly == self.STRUCT_MEMBERS_INPUT_ONLY_EXCLUSIVE and value.isconst):
+                        if checkExpr:
+                            checkExpr += '\n' + indent
+                        checkExpr += expr
+            elif value.isbool:
+                expr = 'skipCall |= validate_bool32(report_data, {}, {}, {}{});\n'.format(name, valueDisplayName, valuePrefix, value.name)
+                if needConditionCheck:
+                    conditionalExprs.append(expr)
+                else:
+                    checkExpr = expr
+                checkExpr += 'printf("Found a boolean\\n");\n'
+                checkExpr += '/* {} xx {} xx {} xx {} */\n'.format(name, valueDisplayName, valuePrefix, value.name)
+                checkExpr += 'printf("%s %s %s\\n", {}, {}, {}{} ? "TRUE" : "FALSE");\n'.format(name, valueDisplayName, valuePrefix, value.name)
+            elif value.israngedenum:
+                enumRange = self.enumRanges[value.type]
+                expr = 'skipCall |= validate_ranged_enum(report_data, {}, {}, "{}", {}, {}, {}{});\n'.format(name, valueDisplayName, value.type, enumRange[0], enumRange[1], valuePrefix, value.name)
+                if needConditionCheck:
+                    conditionalExprs.append(expr)
+                else:
+                    checkExpr = expr
+            #
+            # Append the parameter check to the function body for the current command
+            if checkExpr:
+                funcBody += '\n'
+                if lenParam and ('->' in lenParam.name):
+                    # Add checks to ensure the validation call does not dereference a NULL pointer to obtain the count
+                    funcBody += self.genCheckedLengthCall(indent, lenParam.name, checkExpr)
+                else:
+                    funcBody += indent + checkExpr
+            elif not value.iscount:
+                # If no expression was generated for this value, it is unreferenced by the validation function, unless
+                # it is an array count, which is indirectly referenced for array valiadation.
+                unused.append(value.name)
+        # Add the 'input' only checks
+        if conditionalExprs:
+            funcBody += '\n'
+            funcBody += indent + 'if (isInput) {'
+            indent = self.incIndent(indent)
+            for conditionalExpr in conditionalExprs:
+                funcBody += '\n'
+                funcBody += indent + conditionalExpr
+            indent = self.decIndent(indent)
+            funcBody += indent + '}\n'
+        return funcBody, unused
+    #
+    # Post-process the collected struct member data to create a list of structs
+    # with members that need to be validated
+    def prepareStructMemberData(self):
+        for struct in self.structMembers:
+            inputOnly = False
+            validated = False
+            for member in struct.members:
+                if not member.iscount:
+                    lenParam = self.getLenParam(struct.members, member.len)
+                    # The sType value needs to be validated
+                    # The pNext value needs to be validated
+                    # A required array/count needs to be validated
+                    # A required pointer needs to be validated
+                    # A bool needs to be validated, and the struct is an input parameter
+                    # An enum needs to be validated, and the struct is an input parameter
+                    if member.type in self.structTypes:
+                        validated = True
+                    elif member.name == 'pNext':
+                        validated = True
+                    elif member.ispointer and lenParam:  # This is an array
+                        # Make sure len is not optional
+                        if lenParam.ispointer:
+                            if not lenParam.isoptional[0] or not lenParam.isoptional[1] or not member.isoptional:
+                                validated = True
+                        else:
+                            if not lenParam.isoptional or not member.isoptional:
+                                validated = True
+                    elif member.ispointer and not member.isoptional:
+                        validated = True
+                    elif member.isbool or member.israngedenum:
+                        inputOnly = True
+            #
+            if validated or inputOnly:
+                if not validated:
+                    self.validatedStructs[struct.name] = self.STRUCT_MEMBERS_INPUT_ONLY_EXCLUSIVE
+                elif not inputOnly:
+                    self.validatedStructs[struct.name] = self.STRUCT_MEMBERS_INPUT_ONLY_NONE
+                else:
+                    self.validatedStructs[struct.name] = self.STRUCT_MEMBERS_INPUT_ONLY_MIXED
+            # Second pass to check for struct members that are structs requiring validation
+            # May not be necessary, as structs seem to always be defined before first use in the XML registry
+            for member in struct.members:
+                if member.type in self.validatedStructs:
+                    memberInputOnly = self.validatedStructs[member.type]
+                    if not struct.name in self.validatedStructs:
+                        self.validatedStructs[struct.name] = memberInputOnly
+                    elif self.validatedStructs[struct.name] != memberInputOnly:
+                        self.validatedStructs[struct.name] = self.STRUCT_MEMBERS_INPUT_ONLY_MIXED
+    #
+    # Generate the struct member check code from the captured data
+    def processStructMemberData(self):
+        indent = self.incIndent(None)
+        for struct in self.structMembers:
+            needConditionCheck = False
+            if struct.name in self.validatedStructs and self.validatedStructs[struct.name] == self.STRUCT_MEMBERS_INPUT_ONLY_MIXED:
+                needConditionCheck = True
+            #
+            # The string returned by genFuncBody will be nested in an if check for a NULL pointer, so needs its indent incremented
+            funcBody, unused = self.genFuncBody(self.incIndent(indent), 'pFuncName', struct.members, 'pStruct->', 'pVariableName', struct.name, needConditionCheck)
+            if funcBody:
+                cmdDef = 'static bool api_dump_{}(\n'.format(struct.name)
+                cmdDef += '    debug_report_data*'.ljust(self.genOpts.alignFuncParam) + ' report_data,\n'
+                cmdDef += '    const char*'.ljust(self.genOpts.alignFuncParam) + ' pFuncName,\n'
+                cmdDef += '    const char*'.ljust(self.genOpts.alignFuncParam) + ' pVariableName,\n'
+                # If there is a funcBody, this struct must have an entry in the validatedStructs dictionary
+                if self.validatedStructs[struct.name] == self.STRUCT_MEMBERS_INPUT_ONLY_MIXED:
+                    # If the struct has mixed input only and non-input only members, it needs a flag to indicate if it is an input or output
+                    cmdDef += '    bool'.ljust(self.genOpts.alignFuncParam) + ' isInput,\n'
+                cmdDef += '    const {}*'.format(struct.name).ljust(self.genOpts.alignFuncParam) + ' pStruct)\n'
+                cmdDef += '{\n'
+                cmdDef += indent + 'bool skipCall = false;\n'
+                cmdDef += '\n'
+                cmdDef += indent + 'printf("Entered function {}'.format(struct.name) + '\\n");'
                 cmdDef += '\n'
                 cmdDef += indent + 'if (pStruct != NULL) {'
                 cmdDef += funcBody

@@ -23,8 +23,10 @@
 
 import sys, time, pdb, string, cProfile
 from reg import *
-from generator import write, CGeneratorOptions, COutputGenerator, DocGeneratorOptions, DocOutputGenerator, PyOutputGenerator, ValidityOutputGenerator, HostSynchronizationOutputGenerator, ThreadGeneratorOptions, ThreadOutputGenerator
+from generator import write, CGeneratorOptions, COutputGenerator, DocGeneratorOptions, DocOutputGenerator, PyOutputGenerator, ValidityOutputGenerator, HostSynchronizationOutputGenerator
+from generator import ThreadGeneratorOptions, ThreadOutputGenerator
 from generator import ParamCheckerGeneratorOptions, ParamCheckerOutputGenerator
+from generator import APIDumpGeneratorOptions, APIDumpOutputGenerator
 
 # debug - start header generation in debugger
 # dump - dump registry after loading
@@ -314,6 +316,27 @@ buildList = [
         apientry          = 'VKAPI_CALL ',
         apientryp         = 'VKAPI_PTR *',
         alignFuncParam    = 48)
+    ],
+    [ APIDumpOutputGenerator,
+      APIDumpGeneratorOptions(
+        filename          = 'api_dump2.h',
+        apiname           = 'vulkan',
+        profile           = None,
+        versions          = allVersions,
+        emitversions      = allVersions,
+        defaultExtensions = 'vulkan',
+        addExtensions     = None,
+        removeExtensions  = None,
+       prefixText        = prefixStrings + vkPrefixStrings,
+        genFuncPointers   = True,
+        protectFile       = protectFile,
+       protectFeature    = False,
+        protectProto      = None,
+        protectProtoStr   = 'VK_NO_PROTOTYPES',
+        apicall           = 'VKAPI_ATTR ',
+        apientry          = 'VKAPI_CALL ',
+        apientryp         = 'VKAPI_PTR *',
+       alignFuncParam    = 48)
     ],
     None
 ]

@@ -175,8 +175,8 @@ class Subcommand(object):
             return ("%s", "(%s == VK_TRUE) ? \"VK_TRUE\" : \"VK_FALSE\"" %(name), deref)
         if "size_t" in vk_type:
             if '*' in vk_type:
-                return ("%u", "(%s == NULL) ? 0 : *(%s)" % (name, name), "*")
-            return ("%u", name, deref)
+                return ("%zu", "(%s == NULL) ? 0 : *(%s)" % (name, name), "*")
+            return ("%zu", name, deref)
         if "float" in vk_type:
             if '[' in vk_type: # handle array, current hard-coded to 4 (TODO: Make this dynamic)
                 return ("[%f, %f, %f, %f]", "%s[0], %s[1], %s[2], %s[3]" % (name, name, name, name), deref)
